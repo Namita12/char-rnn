@@ -35,15 +35,17 @@ cmd:text('Options')
 -- data
 cmd:option('-data_dir','data/tinyshakespeare','data directory. Should contain the file input.txt with input data')
 -- model params
-cmd:option('-rnn_size', 128, 'size of LSTM internal state')
-cmd:option('-num_layers', 2, 'number of layers in the LSTM')
+cmd:option('-rnn_size', 200, 'size of LSTM internal state')
+cmd:option('-emb_size', 200, 'word embedding size')
+cmd:option('-num_layers', 1, 'number of layers in the LSTM')
+cmd:option('-mem_size', 15, 'memory size')
 cmd:option('-model', 'lstm', 'lstm,gru or rnn')
 -- optimization
-cmd:option('-learning_rate',2e-3,'learning rate')
-cmd:option('-learning_rate_decay',0.97,'learning rate decay')
-cmd:option('-learning_rate_decay_after',10,'in number of epochs, when to start decaying the learning rate')
+cmd:option('-learning_rate',1,'learning rate')
+cmd:option('-learning_rate_decay',1.5,'learning rate decay')
+cmd:option('-learning_rate_decay_after',4,'in number of epochs, when to start decaying the learning rate')
 cmd:option('-decay_rate',0.95,'decay rate for rmsprop')
-cmd:option('-dropout',0,'dropout for regularization, used after each RNN hidden layer. 0 = no dropout')
+cmd:option('-dropout',0.3,'dropout for regularization, used after each RNN hidden layer. 0 = no dropout')
 cmd:option('-seq_length',50,'number of timesteps to unroll for')
 cmd:option('-batch_size',50,'number of sequences to train on in parallel')
 cmd:option('-max_epochs',50,'number of full passes through the training data')
@@ -67,6 +69,9 @@ cmd:text()
 -- parse input params
 opt = cmd:parse(arg)
 torch.manualSeed(opt.seed)
+
+local Memorym = require 'model.MemBlock'
+local word_embeddings = nn.LookupTable(vocab_size, opt.emb_size)
 -- train / val / test split for data, in fractions
 local test_frac = math.max(0, 1 - (opt.train_frac + opt.val_frac))
 local split_sizes = {opt.train_frac, opt.val_frac, test_frac} 
@@ -108,12 +113,20 @@ if opt.gpuid >= 0 and opt.opencl == 1 then
 end
 
 -- create the data loader class
-local loader = CharSplitLMMinibatchLoader.create(opt.data_dir, opt.batch_size, opt.seq_length, split_sizes)
-local vocab_size = loader.vocab_size  -- the number of distinct characters
+local loader = TextProcessor.create(opt.data_dir, opt.batch_size, opt.min_seq_length, opt.max_seq_length, 5, opt.mem_size)
+local vocab_size = loader.vocab_size
 local vocab = loader.vocab_mapping
-print('vocab size: ' .. vocab_size)
--- make sure output directory exists
-if not path.exists(opt.checkpoint_dir) then lfs.mkdir(opt.checkpoint_dir) end
+-- need for visualization
+local id2word = {}
+for w,id in pairs(vocab) do
+    id2word[id] = w
+end
+
+print('vocabulary size: ' .. vocab_size)
+-- create an LSTM
+protos = {}
+protos.rnn1 = LSTM.lstm(opt.emb_size, opt.rnn_size, opt.num_layers, opt.dropout)
+protos.rnn2 = LSTM.lstm(opt.rnn_size, opt.rnn_size, opt.num_layers, opt.dropout)
 
 -- define the model: prototypes for one timestep, then clone them in time
 local do_random_init = true
@@ -145,7 +158,7 @@ else
     print('creating an ' .. opt.model .. ' with ' .. opt.num_layers .. ' layers')
     protos = {}
     if opt.model == 'lstm' then
-        protos.rnn = LSTM.lstm(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
+        protos.rnn1 = LSTM.lstm(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
     elseif opt.model == 'gru' then
         protos.rnn = GRU.gru(vocab_size, opt.rnn_size, opt.num_layers, opt.dropout)
     elseif opt.model == 'rnn' then
@@ -161,7 +174,6 @@ for L=1,opt.num_layers do
     if opt.gpuid >=0 and opt.opencl == 0 then h_init = h_init:cuda() end
     if opt.gpuid >=0 and opt.opencl == 1 then h_init = h_init:cl() end
     table.insert(init_state, h_init:clone())
-    if opt.model == 'lstm' then
         table.insert(init_state, h_init:clone())
     end
 end
@@ -175,13 +187,14 @@ if opt.gpuid >= 0 and opt.opencl == 1 then
 end
 
 -- put the above things into one flattened parameters tensor
-params, grad_params = model_utils.combine_all_parameters(protos.rnn)
+params, grad_params = model_utils.combine_all_parameters(protos.rnn1, protos.rnn2,word_embedding,memoryn)
 
 -- initialization
 if do_random_init then
-    params:uniform(-0.08, 0.08) -- small uniform numbers
+    params:uniform(-0.05, 0.05) -- small uniform numbers
 end
 -- initialize the LSTM forget gates with slightly higher biases to encourage remembering in the beginning
+function init_forget_gate(rnn)
 if opt.model == 'lstm' then
     for layer_idx = 1, opt.num_layers do
         for _,node in ipairs(protos.rnn.forwardnodes) do
@@ -193,7 +206,8 @@ if opt.model == 'lstm' then
         end
     end
 end
-
+init_forget_gate(protos.rnn1)
+init_forget_gate(protos.rnn2)
 print('number of parameters in the model: ' .. params:nElement())
 -- make a bunch of clones after flattening, as that reallocates memory
 clones = {}
@@ -262,11 +276,19 @@ function feval(x)
     local x, y = loader:next_batch(1)
     x,y = prepro(x,y)
     ------------------- forward pass -------------------
-    local rnn_state = {[0] = init_state_global}
-    local predictions = {}           -- softmax outputs
+    local rnn_state1 = {[0] = init_state_global2}
+    local rnn_state2 = {[0] = init_state_global}
+    local embeddings = word_embeddings:forward(x)
     local loss = 0
     for t=1,opt.seq_length do
-        clones.rnn[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)
+        clones.rnn1[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)
+        local lst = clones.rnn[t]:forward{x[t], unpack(rnn_state[t-1])}
+        rnn_state[t] = {}
+        for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end -- extract the state, without output
+        predictions[t] = lst[#lst] -- last element is the prediction
+        loss = loss + clones.criterion[t]:forward(predictions[t], y[t])
+        
+        clones.rnn2[t]:training() -- make sure we are in correct mode (this is cheap, sets flag)
         local lst = clones.rnn[t]:forward{x[t], unpack(rnn_state[t-1])}
         rnn_state[t] = {}
         for i=1,#init_state do table.insert(rnn_state[t], lst[i]) end -- extract the state, without output
@@ -276,30 +298,40 @@ function feval(x)
     loss = loss / opt.seq_length
     ------------------ backward pass -------------------
     -- initialize gradient at time t to be zeros (there's no influence from future)
-    local drnn_state = {[opt.seq_length] = clone_list(init_state, true)} -- true also zeros the clones
+    local drnn_state1 = {[opt.seq_length] = clone_list(init_state, true)} -- true also zeros the clones
+    local drnn_state2 = {[opt.seq_length]=clone_list(init_state, true)}
     for t=opt.seq_length,1,-1 do
         -- backprop through loss, and softmax/linear
         local doutput_t = clones.criterion[t]:backward(predictions[t], y[t])
-        table.insert(drnn_state[t], doutput_t)
-        local dlst = clones.rnn[t]:backward({x[t], unpack(rnn_state[t-1])}, drnn_state[t])
-        drnn_state[t-1] = {}
+        table.insert(drnn_state2[t], doutput_t)
+        local dlst2 = clones.rnn2[t]:backward({x[t], unpack(rnn_state[t-1])}, drnn_state[t])
+        drnn_state2[t-1] = {}
         for k,v in pairs(dlst) do
             if k > 1 then -- k == 1 is gradient on x, which we dont need
                 -- note we do k-1 because first item is dembeddings, and then follow the 
                 -- derivatives of the state, starting at index 2. I know...
-                drnn_state[t-1][k-1] = v
+                drnn_state2[t-1][k-1] = v
             end
         end
+end
+-- backprop for Memory Block
+ local grad_mem_t = memoryn:backward(inp_mem[t], grad_in_mem)
+        drnn_state1[t][last]:add(grad_mem_t[1])
+
+-- backprop for word embeddings
+word_embeddings:backward(x, grad_embs)
+    local norm_dw = grad_params:norm()
+    if norm_dw > opt.max_grad_norm then
+        local shink_factor = opt.max_grad_norm/norm_dw
+        grad_params:mul(shink_factor)
     end
-    ------------------------ misc ----------------------
-    -- transfer final state to initial state (BPTT)
-    init_state_global = rnn_state[#rnn_state] -- NOTE: I don't think this needs to be a clone, right?
-    -- grad_params:div(opt.seq_length) -- this line should be here but since we use rmsprop it would have no effect. Removing for efficiency
-    -- clip gradient element-wise
-    grad_params:clamp(-opt.grad_clip, opt.grad_clip)
-    return loss, grad_params
+    params:add(grad_params:mul(-opt.learning_rate))
+    return loss
 end
 
+    ------------------------ misc ----------------------
+    -- transfer final state to initial state (BPTT)
+    
 -- start optimization here
 train_losses = {}
 val_losses = {}
